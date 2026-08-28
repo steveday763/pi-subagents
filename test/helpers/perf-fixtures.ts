@@ -232,14 +232,14 @@ export function mountWidget(
 
 /** Drive `FleetList`: same idea, but its widget renders at an explicit width. */
 export function mountFleet(FleetList: any, records: unknown[]) {
-  const fleet = new FleetList(makeManager(records), makeActivity(records as { id: string; toolUses: number }[]));
+  const sessionView = { currentAgentId: () => undefined, showAgent: () => {}, showMain: () => {} };
+  const fleet = new FleetList(makeManager(records), sessionView);
   let factory: any;
   fleet.setUICtx({
     setWidget: (_key: string, content: any) => { factory = content; },
     onTerminalInput: () => () => {},
     getEditorText: () => "",
     notify: () => {},
-    custom: () => new Promise(() => {}),
   });
   fleet.update();
   const tui = perfTui();

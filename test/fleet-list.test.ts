@@ -2,8 +2,8 @@ import { Editor, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import { registerAgents } from "../src/agent-types.js";
-import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
-import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
+import type { AgentConfig, AgentRecord } from "../src/types.js";
+import { getDisplayName } from "../src/ui/agent-widget.js";
 import {
   FleetList,
   type FleetUICtx,
@@ -11,6 +11,7 @@ import {
   formatFleetElapsed,
   formatFleetTokens,
 } from "../src/ui/fleet-list.js";
+import type { NativeSessionView } from "../src/ui/native-session-switcher.js";
 
 // ---- Key sequences (see node_modules/@earendil-works/pi-tui/dist/keys.js) ----
 const DOWN = "\x1b[B";
@@ -68,9 +69,14 @@ function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
 function fakeManager(agents: AgentRecord[]): AgentManager {
   return {
     listAgents: () => agents,
+    getRecord: (id: string) => agents.find(agent => agent.id === id),
     abort: () => true,
     steer: vi.fn(() => true),
   } as unknown as AgentManager;
+}
+
+function stubSessionView(): NativeSessionView {
+  return { currentAgentId: () => undefined, showAgent: () => {}, showMain: () => {} };
 }
 
 interface Harness {
@@ -83,19 +89,13 @@ interface Harness {
   openedWorkflows: () => string[];
   /** Settle the workflow dialog the list last opened; flushes the close microtask. */
   closeWorkflowDialog: () => Promise<void>;
-  /** The overlay component (a real ConversationViewer) once one is opened. */
-  overlayComponent: () => { handleInput(data: string): void } | undefined;
   /** Feed a key to the registered input handler; returns the consume result. */
   press: (data: string) => { consume?: boolean } | undefined;
   /** Render the currently-registered below-editor widget at the given width. */
   render: (width?: number) => string[];
   setEditorText: (t: string) => void;
-  /** Whether an overlay has been opened. */
-  overlayOpened: () => boolean;
-  /** Whether the most recently opened overlay's `done` was invoked (closed). */
-  overlayClosed: () => boolean;
-  /** Simulate the viewer closing itself (Esc → done); flushes the close microtask. */
-  closeOverlay: () => Promise<void>;
+  switchedAgents: () => string[];
+  mainSwitches: () => number;
   /** The fake `tui` handed to the widget factory; tests set `focusedComponent` on it. */
   widgetTui: { requestRender(): void; focusedComponent?: unknown };
 }
@@ -113,41 +113,29 @@ function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
   };
 }
 
-function harness(
-  agents: AgentRecord[],
-  opts: {
-    viewerMarkdown?: () => ViewerMarkdownMode;
-    onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
-  } = {},
-): Harness {
+function harness(agents: AgentRecord[]): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
   let editorText = "";
-  let opened = false;
-  let closed = false;
-  let overlayDone: ((r: undefined) => void) | undefined;
-  let overlayComponent: { handleInput(data: string): void } | undefined;
   const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
+  const switched: string[] = [];
+  let mainSwitchCount = 0;
+  let currentAgentId: string | undefined;
+  const sessionView: NativeSessionView = {
+    currentAgentId: () => currentAgentId,
+    showAgent: (record) => { currentAgentId = record.id; switched.push(record.id); },
+    showMain: () => { currentAgentId = undefined; mainSwitchCount++; },
+  };
 
   const ui: FleetUICtx = {
     setWidget: (_key, content) => { widgetFactory = content as any; },
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
     notify: () => {},
-    custom: ((factory: any) => {
-      opened = true;
-      return new Promise<undefined>((resolve) => {
-        const done = (r: undefined) => { closed = true; overlayDone = undefined; resolve(r); };
-        overlayDone = done;
-        // Construct the overlay component so the controller wires viewerClose,
-        // and keep it so tests can drive the real ConversationViewer's input.
-        overlayComponent = factory(fakeTui, theme, undefined, done);
-      });
-    }) as FleetUICtx["custom"],
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(manager, sessionView);
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -167,13 +155,11 @@ function harness(
     closeWorkflowDialog: async () => { closeWorkflowDialog?.(); await Promise.resolve(); },
     ui,
     manager,
-    overlayComponent: () => overlayComponent,
     press: (data) => inputHandler?.(data),
     render: (width = 120) => (widgetFactory ? widgetFactory(fakeTui, theme).render(width) : []),
     setEditorText: (t) => { editorText = t; },
-    overlayOpened: () => opened,
-    overlayClosed: () => closed,
-    closeOverlay: async () => { overlayDone?.(undefined); await Promise.resolve(); },
+    switchedAgents: () => switched,
+    mainSwitches: () => mainSwitchCount,
     widgetTui: fakeTui,
   };
 }
@@ -219,7 +205,7 @@ describe("FleetList navigation", () => {
     const res = h.press(DOWN);
     expect(res).toEqual({ consume: true });
     // main selected, list active → nav hint shown
-    expect(h.render().some(l => l.includes("enter view"))).toBe(true);
+    expect(h.render().some(l => l.includes("enter switch"))).toBe(true);
   });
 
   it("also activates on ← (matches the '← for agents' hint)", () => {
@@ -343,10 +329,10 @@ describe("FleetList navigation", () => {
       const agents = [makeRecord({ id: "a1" })];
       const listAgents = vi.fn(() => agents);
       const manager = { listAgents, abort: () => true } as unknown as AgentManager;
-      const fleet = new FleetList(manager, new Map());
+      const fleet = new FleetList(manager, stubSessionView());
       fleet.setUICtx({
         setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
-        notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
+        notify: () => {},
       });
       fleet.update();          // shows list, arms the timer
       fleet.setEnabled(false); // hides, clears the timer
@@ -482,16 +468,17 @@ describe("FleetList rendering", () => {
   });
 });
 
-describe("FleetList overlay lifecycle", () => {
-  it("Enter on 'main' just deactivates (no overlay)", () => {
+describe("FleetList native session switching", () => {
+  it("Enter on main restores the root native session", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN); // active, index 0 (main)
     h.press(ENTER);
-    expect(h.overlayOpened()).toBe(false); // never opened an overlay
+    expect(h.mainSwitches()).toBe(1);
+    expect(h.switchedAgents()).toEqual([]);
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
-  it("keeps the cursor on the viewed agent after closing, even if the list reordered", async () => {
+  it("keeps the cursor on the selected native session if the list reorders", () => {
     const fakeSession = { subscribe: () => () => {}, messages: [] };
     const agents = [
       makeRecord({ id: "a1", description: "one", session: fakeSession as any }),
@@ -502,61 +489,74 @@ describe("FleetList overlay lifecycle", () => {
     h.press(DOWN); // activate (main, idx 0)
     h.press(DOWN); // a1 (idx 1)
     h.press(DOWN); // a2 (idx 2)
-    h.press(ENTER); // open a2
-    // a1 finishes and drops out while viewing → a2 shifts from idx 2 to idx 1.
+    h.press(ENTER); // switch to a2
+    expect(h.switchedAgents()).toEqual(["a2"]);
+    // a1 drops out while viewing → a2 shifts from idx 2 to idx 1.
     agents.splice(0, 1);
-    await h.closeOverlay();
+    h.fleet.update();
     // Selection follows a2 ("two") to its new position, not whatever is at idx 2 now.
     expect(h.render().find(l => l.includes("two"))).toContain("●");
     expect(h.render().find(l => l.includes("three"))).toContain("○");
   });
 
-  it("wires the viewer's steer composer to manager.steer with the agent id", () => {
-    const agents = [makeRecord({ id: "live", description: "the one" })];
-    const h = harness(agents);
-    h.press(DOWN);  // activate (main)
-    h.press(DOWN);  // → the agent
-    h.press(ENTER); // open the conversation viewer
-
-    const viewer = h.overlayComponent();
-    expect(viewer).toBeDefined();
-    viewer!.handleInput("\r");                       // Enter → open composer
-    for (const ch of "go left") viewer!.handleInput(ch);
-    viewer!.handleInput("\r");                       // Enter → send
-
-    expect(h.manager.steer).toHaveBeenCalledWith("live", "go left");
-  });
-
-  it("hands the viewer the user's markdown setting, and persists a mode chosen with m", () => {
-    const persisted: ViewerMarkdownMode[] = [];
-    const h = harness([makeRecord({ id: "live", description: "the one" })], {
-      viewerMarkdown: () => "all",
-      onViewerMarkdown: (mode) => persisted.push(mode),
-    });
-    h.press(DOWN);  // activate (main)
-    h.press(DOWN);  // → the agent
-    h.press(ENTER); // open the conversation viewer
-
-    h.overlayComponent()!.handleInput("m");
-
-    // "all" → "off" proves the cycle started from the *setting*; the viewer's own
-    // fallback would have started at "assistant" and landed on "all". A recorded
-    // value at all proves the persist hook is wired, as it is from /agents.
-    expect(persisted).toEqual(["off"]);
-  });
-
-  it("does NOT auto-close when the viewed agent finishes (final output stays readable)", () => {
+  it("keeps a completed agent on the native surface until main is selected", () => {
     const agents = [makeRecord({ id: "live", description: "the one" })];
     const h = harness(agents);
     h.press(DOWN); // active (main)
     h.press(DOWN); // → the agent
-    h.press(ENTER); // opens overlay
-    expect(h.overlayOpened()).toBe(true);
-    // The agent finishes, well past the linger window...
+    h.press(ENTER); // switches native surface
+    expect(h.switchedAgents()).toEqual(["live"]);
+    // The agent finishes, well past the normal linger window.
     agents[0] = makeRecord({ id: "live", description: "the one", status: "completed", completedAt: Date.now() - 60_000 });
     h.fleet.onAgentFinished("live");
-    expect(h.overlayClosed()).toBe(false);                          // viewer stays open
-    expect(h.render().some(l => l.includes("the one"))).toBe(true); // and stays listed while viewed
+    expect(h.render().some(l => l.includes("the one"))).toBe(true);
+
+    h.press(DOWN); // activate at the current agent
+    h.press(UP);   // main
+    h.press(ENTER);
+    expect(h.mainSwitches()).toBe(1);
+  });
+
+  it("returns main when FleetView is disabled", () => {
+    const h = harness([makeRecord({ id: "live" })]);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+    expect(h.fleet.setEnabled(false)).toBe(true);
+    expect(h.mainSwitches()).toBe(1);
+    expect(h.render()).toEqual([]);
+  });
+
+  it("stays enabled when the native session cannot safely switch back", () => {
+    const notify = vi.fn();
+    const fleet = new FleetList(fakeManager([makeRecord()]), {
+      currentAgentId: () => "a1",
+      showAgent: () => {},
+      showMain: () => { throw new Error("child is compacting"); },
+    });
+    fleet.setUICtx({
+      setWidget: () => {},
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify,
+    });
+
+    expect(fleet.setEnabled(false)).toBe(false);
+    expect(notify).toHaveBeenCalledWith(
+      "Cannot disable FleetView: child is compacting",
+      "warning",
+    );
+  });
+
+  it("returns main if the selected record is evicted", () => {
+    const agents = [makeRecord({ id: "live" })];
+    const h = harness(agents);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+    agents.splice(0, 1);
+    h.fleet.update();
+    expect(h.mainSwitches()).toBe(1);
   });
 
   it("lingers a finished agent in the list, then drops it after the window", () => {
@@ -570,16 +570,15 @@ describe("FleetList overlay lifecycle", () => {
 describe("FleetList cost display", () => {
   const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
 
-  function row(showCost: boolean, cost: number, activity?: Map<string, AgentActivity>): string {
+  function row(showCost: boolean, cost: number): string {
     const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
-    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), () => showCost);
+    const fleet = new FleetList(fakeManager([record]), stubSessionView(), () => showCost);
     let factory: any;
     fleet.setUICtx({
       setWidget: (_k: string, c: any) => { factory = c; },
       onTerminalInput: () => () => {},
       getEditorText: () => "",
       notify: () => {},
-      custom: (() => new Promise(() => {})) as any,
     } as any);
     fleet.update();
     return factory({ requestRender: () => {}, terminal: { columns: 120, rows: 40 } }, theme).render(120).join("\n");
@@ -596,20 +595,8 @@ describe("FleetList cost display", () => {
     expect(row(true, 0)).not.toContain("$");
   });
 
-  it("reads the record, so the figures do not change when the agent finishes", () => {
-    // Spend used to come from the live activity tracker while an agent ran and
-    // from its record once the tracker was deleted. The two disagree: only the
-    // record carries a nested child's spend (nested-tools folds it into every
-    // ancestor), so the number jumped upward at completion.
-    // The stale shape on purpose: an activity entry carrying figures of its own
-    // is what the old fallback preferred, so a row that still renders the
-    // record's numbers proves the tracker is no longer consulted for spend.
-    const tracked = new Map<string, AgentActivity>([["a1", {
-      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
-      lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
-    } as unknown as AgentActivity]]);
-
-    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+  it("reads cost from the record", () => {
+    expect(row(true, 0.0042)).toContain("~$0.0042");
   });
 });
 
@@ -644,7 +631,7 @@ describe("FleetList workflow rows", () => {
     h.press(ENTER);
 
     // The second agent, not a run and not `main`.
-    expect(h.overlayOpened()).toBe(true);
+    expect(h.switchedAgents()).toEqual(["a2"]);
     expect(h.openedWorkflows()).toEqual([]);
   });
 
@@ -713,7 +700,7 @@ describe("FleetList workflow rows", () => {
     expect(h.press(DOWN)?.consume).toBeFalsy();
   });
 
-  it("opens the selected run rather than a conversation viewer", () => {
+  it("opens the selected run rather than switching the native agent session", () => {
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
     h.setWorkflows([makeWorkflow({ id: "wf_pick" })]);
 
@@ -722,8 +709,7 @@ describe("FleetList workflow rows", () => {
     h.press(ENTER);
 
     expect(h.openedWorkflows()).toEqual(["wf_pick"]);
-    // The workflow dialog owns its own overlay; the list must not open one.
-    expect(h.overlayOpened()).toBe(false);
+    expect(h.switchedAgents()).toEqual([]);
   });
 
   const NOW = Date.now();
@@ -775,7 +761,7 @@ describe("FleetList workflow rows", () => {
     expect(h.render().find(l => l.includes("started-meanwhile"))).not.toContain("●");
   });
 
-  it("still opens an agent's viewer when the selection is past the runs", () => {
+  it("still switches to an agent when the selection is past the runs", () => {
     const h = harness([makeRecord({ id: "a1", description: "one" })]);
     h.setWorkflows([makeWorkflow()]);
 
@@ -785,7 +771,7 @@ describe("FleetList workflow rows", () => {
     h.press(ENTER);
 
     expect(h.openedWorkflows()).toEqual([]);
-    expect(h.overlayOpened()).toBe(true);
+    expect(h.switchedAgents()).toEqual(["a1"]);
   });
 
   it("drops a settled run once it stops lingering, and keeps a live one", () => {

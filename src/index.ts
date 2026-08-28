@@ -57,6 +57,7 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
+import { getNativeSessionSwitcher } from "./ui/native-session-switcher.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
@@ -304,6 +305,11 @@ export default function (pi: ExtensionAPI) {
   // injected as scoped custom tools by the existing manager instead.
   if (inChildSessionContext()) return;
 
+  // Pi exposes no public live-session viewport API. The version-pinned bridge
+  // patches the host's aliased InteractiveMode class before initial rendering;
+  // unsupported ABIs fail here instead of silently reopening the old overlay.
+  const nativeSession = getNativeSessionSwitcher();
+
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
     "subagent-notification",
@@ -433,10 +439,9 @@ export default function (pi: ExtensionAPI) {
   function getViewerMarkdown(): ViewerMarkdownMode { return viewerMarkdown; }
   function setViewerMarkdown(mode: ViewerMarkdownMode): void { viewerMarkdown = mode; }
   /**
-   * The viewer's `m` key, from either entry point: set the mode and persist it,
-   * so the key and `/agents → Settings` stay one setting rather than one per
-   * entry point. `ctx` carries only the warning a failed write notifies with,
-   * and the fleet list may be acting without one.
+   * The viewer's `m` key, from `/agents` or the workflow inspector: set the
+   * mode and persist it, so the key and `/agents → Settings` stay one setting.
+   * `ctx` carries only the warning a failed write notifies with.
    */
   function chooseViewerMarkdown(mode: ViewerMarkdownMode, ctx?: ExtensionCommandContext): void {
     setViewerMarkdown(mode);
@@ -788,6 +793,17 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    nativeSession.bind({
+      steer: (record, prompt) => manager.steer(record.id, prompt),
+      resume: async (record, prompt) => {
+        const config = getAgentConfig(record.type);
+        const resumed = await startBackgroundResume(ctx, record, prompt, {
+          outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+          maxTurns: record.invocation?.maxTurns,
+        });
+        return resumed !== undefined;
+      },
+    });
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1088,6 +1104,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    // Runtime replacement must see the real root session, never the child that
+    // the native viewport getter currently projects.
+    nativeSession.showMain();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -1095,6 +1114,9 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    // Detach before the runtime invalidates the root session. This intentionally
+    // does not render/subscribe main: the host owns the incoming teardown/rebind.
+    nativeSession.detach();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1133,13 +1155,16 @@ export default function (pi: ExtensionAPI) {
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  // The last two arguments keep a conversation overlay opened here identical to
-  // one opened from `/agents`: same setting on the way in, same persist out.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+  // Agent rows switch Pi's native transcript/editor/footer; ConversationViewer
+  // remains only in the explicit /agents and workflow inspection surfaces.
+  const fleet = new FleetList(manager, nativeSession, isShowCostEnabled);
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
-  function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
+  function setFleetViewEnabled(b: boolean): boolean {
+    if (!fleet.setEnabled(b)) return false;
+    fleetViewEnabled = b;
+    return true;
+  }
 
   // Claude Code-style `@handle message` prompt mentions. Read live by both the
   // `input` hook and the stacked autocomplete provider, so the toggle applies
@@ -3652,7 +3677,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "fleetView",
           label: "Fleet view",
-          description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
+          description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter switches the native transcript/editor/footer)",
           currentValue: isFleetViewEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -3825,8 +3850,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         notifyApplied(ctx, `Viewer markdown set to ${value}`);
       } else if (id === "fleetView") {
         const enabled = value === "on";
-        setFleetViewEnabled(enabled);
-        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
+        if (setFleetViewEnabled(enabled)) {
+          notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
+        }
       } else if (id === "agentMentions") {
         const mode = value as AgentMentionMode;
         setAgentMentionMode(mode);
